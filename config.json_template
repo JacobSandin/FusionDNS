@@ -1,0 +1,8 @@
+{
+    "log_level": "debug",
+    "db_settings": "mysql://user:password@127.0.0.1:3306/dnsproxy?charset=utf8mb4",
+    "upstream_dns": "8.8.8.8:53",
+    "bind_address": "0.0.0.0",
+    "port": 5353
+}
+
