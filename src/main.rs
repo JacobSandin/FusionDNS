@@ -8,6 +8,8 @@ use trust_dns_proto::rr::rdata::{A, CNAME};
 use mysql_async::{Pool, prelude::*};
 use log::{info, warn, error};
 use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::pin::Pin;
 
 // Configuration struct
 #[derive(Deserialize)]
@@ -71,44 +73,155 @@ fn load_config(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
     Ok(config)
 }
 
-// Handle DNS queries
-async fn handle_query(query: Query, pool: &Pool, cache: &mut Cache, cache_file: &str, sql_query: &str) -> Option<Record> {
+
+// Define a helper type for a boxed future
+type BoxedFuture<'a> = Pin<Box<dyn Future<Output = Vec<Record>> + Send + 'a>>;
+
+fn handle_query_recursive<'a>(
+    query: Query,
+    pool: &'a Pool,
+    cache: &'a mut Cache,
+    cache_file: &'a str,
+    sql_query: &'a str,
+) -> BoxedFuture<'a> {
+    Box::pin(async move {
+        let mut records = Vec::new();
+        let qname = query.name().to_string().trim_end_matches('.').to_string();
+        let qtype = query.query_type();
+
+        info!("Handling query: {} {:?}", qname, qtype);
+
+        // Step 1: Check the cache first
+        if let Some(cached) = cache.get(&qname) {
+            let name = query.name().clone();
+            let ttl = cached.ttl;
+
+            if cached.record_type == "A" && qtype == RecordType::A {
+                if let Ok(addr) = cached.value.parse::<std::net::Ipv4Addr>() {
+                    records.push(Record::from_rdata(name, ttl, RData::A(A(addr))));
+                }
+            } else if cached.record_type == "CNAME" && qtype == RecordType::CNAME {
+                if let Ok(cname) = Name::parse(&cached.value, None) {
+                    records.push(Record::from_rdata(name.clone(), ttl, RData::CNAME(CNAME(cname.clone()))));
+
+                    // Recursively fetch the A record for the CNAME
+                    let a_query = Query::query(cname.clone(), RecordType::A);
+                    let a_records = handle_query_recursive(a_query, pool, cache, cache_file, sql_query).await;
+                    records.extend(a_records);
+                }
+            }
+            return records;
+        }
+
+        // Step 2: Query the database
+        let mut conn = match pool.get_conn().await {
+            Ok(conn) => conn,
+            Err(_) => {
+                warn!("Database connection failed; returning cache result if available.");
+                return records;
+            }
+        };
+
+        let result: Option<(String, String)> = match conn.exec_first(sql_query, (qname.clone(),)).await {
+            Ok(res) => res,
+            Err(e) => {
+                warn!("Database query error: {}", e);
+                return records;
+            }
+        };
+
+        if let Some((record_type, value)) = result {
+            info!("Database result: {} -> {} {}", qname, record_type, value);
+
+            let name = query.name().clone();
+            let ttl = 3600;
+
+            // Update the cache
+            cache.insert(
+                qname.clone(),
+                DnsRecord {
+                    record_type: record_type.clone(),
+                    value: value.clone(),
+                    ttl,
+                },
+            );
+            cache.save(cache_file);
+
+            if record_type == "A" && qtype == RecordType::A {
+                if let Ok(addr) = value.parse::<std::net::Ipv4Addr>() {
+                    records.push(Record::from_rdata(name, ttl, RData::A(A(addr))));
+                }
+            } else if record_type == "CNAME" {
+                if let Ok(cname) = Name::parse(&value, None) {
+                    records.push(Record::from_rdata(name.clone(), ttl, RData::CNAME(CNAME(cname.clone()))));
+
+                    // Recursively fetch the A record for the CNAME
+                    let a_query = Query::query(cname.clone(), RecordType::A);
+                    let a_records = handle_query_recursive(a_query, pool, cache, cache_file, sql_query).await;
+                    records.extend(a_records);
+                }
+            }
+        } else {
+            // No result, remove from cache
+            cache.remove(&qname);
+            cache.save(cache_file);
+        }
+
+        records
+    })
+}
+
+async fn handle_query(
+    query: Query,
+    pool: &Pool,
+    cache: &mut Cache,
+    cache_file: &str,
+    sql_query: &str,
+) -> Vec<Record> {
+    let mut records = Vec::new();
     let qname = query.name().to_string().trim_end_matches('.').to_string();
     let qtype = query.query_type();
 
     info!("Handling query: {} {:?}", qname, qtype);
 
+    // Check the cache first
+    if let Some(cached) = cache.get(&qname) {
+        info!("Cache hit for {}: {:?}", qname, cached);
+
+        let name = query.name().clone();
+        let ttl = cached.ttl;
+
+        if cached.record_type == "A" && qtype == RecordType::A {
+            if let Ok(addr) = cached.value.parse::<std::net::Ipv4Addr>() {
+                records.push(Record::from_rdata(name, ttl, RData::A(A(addr))));
+            }
+        } else if cached.record_type == "CNAME" {
+            if let Ok(cname) = Name::parse(&cached.value, None) {
+                records.push(Record::from_rdata(name.clone(), ttl, RData::CNAME(CNAME(cname.clone()))));
+
+                // Recursively resolve the A record for the CNAME
+                let a_query = Query::query(cname.clone(), RecordType::A);
+                let a_records = handle_query_recursive(a_query, pool, cache, cache_file, sql_query).await;
+                records.extend(a_records);
+            }
+        }
+        return records;
+    }
+
+    // Query the database
     let mut conn = match pool.get_conn().await {
         Ok(conn) => conn,
         Err(_) => {
-            warn!("Database connection failed, checking cache...");
-            return cache.get(&qname).and_then(|cached| {
-                if (cached.record_type == "A" && qtype == RecordType::A)
-                    || (cached.record_type == "CNAME" && qtype == RecordType::CNAME)
-                {
-                    let name = query.name().clone();
-                    let ttl = cached.ttl;
-                    if cached.record_type == "A" {
-                        if let Ok(addr) = cached.value.parse::<std::net::Ipv4Addr>() {
-                            return Some(Record::from_rdata(name, ttl, RData::A(A(addr))));
-                        }
-                    } else if cached.record_type == "CNAME" {
-                        if let Ok(cname) = Name::parse(&cached.value, None) {
-                            return Some(Record::from_rdata(name, ttl, RData::CNAME(CNAME(cname))));
-                        }
-                    }
-                }
-                None
-            });
+            warn!("Database connection failed.");
+            return records; // Return empty records if the database is unreachable
         }
     };
 
-    //let sql_query = "SELECT `type`, `value` FROM `dns-override` WHERE `address` = ?";
     let result: Option<(String, String)> = match conn.exec_first(sql_query, (qname.clone(),)).await {
         Ok(res) => res,
         Err(e) => {
             warn!("Database query error: {}", e);
-            return None;
+            return records;
         }
     };
 
@@ -118,6 +231,7 @@ async fn handle_query(query: Query, pool: &Pool, cache: &mut Cache, cache_file: 
         let name = query.name().clone();
         let ttl = 3600;
 
+        // Update the cache
         cache.insert(
             qname.clone(),
             DnsRecord {
@@ -130,22 +244,23 @@ async fn handle_query(query: Query, pool: &Pool, cache: &mut Cache, cache_file: 
 
         if record_type == "A" && qtype == RecordType::A {
             if let Ok(addr) = value.parse::<std::net::Ipv4Addr>() {
-                return Some(Record::from_rdata(name, ttl, RData::A(A(addr))));
+                records.push(Record::from_rdata(name, ttl, RData::A(A(addr))));
             }
-        } else if record_type == "CNAME" && qtype == RecordType::CNAME {
+        } else if record_type == "CNAME" {
             if let Ok(cname) = Name::parse(&value, None) {
-                return Some(Record::from_rdata(name, ttl, RData::CNAME(CNAME(cname))));
+                records.push(Record::from_rdata(name.clone(), ttl, RData::CNAME(CNAME(cname.clone()))));
+
+                // Recursively resolve the A record for the CNAME
+                let a_query = Query::query(cname.clone(), RecordType::A);
+                let a_records = handle_query_recursive(a_query, pool, cache, cache_file, sql_query).await;
+                records.extend(a_records);
             }
         }
-    } else {
-        cache.remove(&qname);
-        cache.save(cache_file);
     }
 
-    None
+    records
 }
 
-// Run the DNS proxy
 async fn run_proxy(
     listen_addr: &str,
     db_url: &str,
@@ -159,6 +274,7 @@ async fn run_proxy(
     let upstream_addr: SocketAddr = upstream_dns.parse()?;
     let upstream_socket = UdpSocket::bind("0.0.0.0:0").await?;
 
+    // Load cache
     let mut cache = Cache::load(cache_file);
 
     info!("DNS proxy listening on {}", listen_addr);
@@ -174,25 +290,46 @@ async fn run_proxy(
 
         let mut handled = false;
 
+
         for query in message.queries() {
             info!("Received query from {}: {:?}", src, query);
-            if let Some(record) = handle_query(query.clone(), &pool, &mut cache, cache_file, sql_query).await {
-                response.add_answer(record);
+        
+            // Fetch records from handle_query
+            let records = handle_query(query.clone(), &pool, &mut cache, cache_file, sql_query).await;
+        
+            if !records.is_empty() {
+                for record in &records {  // Use a reference to avoid consuming the Vec
+                    response.add_answer(record.clone()); // Clone the record if needed
+                }
                 handled = true;
-                info!("Query handled from database or cache: {:?}", query.name());
+                info!("Query resolved locally: {:?}", records);
+            } else {
+                info!("No local result for {}, forwarding to upstream DNS.", query.name());
             }
         }
 
+
+        
         if handled {
+            // Send the response if the query was handled locally
             let response_buf = response.to_vec()?;
             socket.send_to(&response_buf, src).await?;
+            info!("Response sent to {} from database/cache", src);
         } else {
+            // Forward the query to the upstream DNS server
             upstream_socket.send_to(&buf[..len], upstream_addr).await?;
+            info!("Forwarded query to upstream DNS: {}", upstream_dns);
+        
+            // Receive the response from the upstream server
             let (upstream_len, _) = upstream_socket.recv_from(&mut buf).await?;
             socket.send_to(&buf[..upstream_len], src).await?;
+            info!("Response sent to {} from upstream DNS", src);
         }
+
+
     }
 }
+
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -201,9 +338,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listen_addr = format!("{}:{}", config.bind_address, config.port);
     let db_url = config.db_settings;
-    let sql_query = config.sql_query;
     let upstream_dns = config.upstream_dns;
     let cache_file = "dns_cache.json";
+    let sql_query = config.sql_query; 
+        //"SELECT `type`, `value` FROM `dns_override` WHERE `address` = ?";
 
     run_proxy(&listen_addr, &db_url, &upstream_dns, cache_file, &sql_query).await
 }
