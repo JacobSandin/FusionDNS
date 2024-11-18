@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 struct Config {
     log_level: String,
     db_settings: String,
+    sql_query: String,
     upstream_dns: String,
     bind_address: String,
     port: u16,
@@ -71,7 +72,7 @@ fn load_config(path: &str) -> Result<Config, Box<dyn std::error::Error>> {
 }
 
 // Handle DNS queries
-async fn handle_query(query: Query, pool: &Pool, cache: &mut Cache, cache_file: &str) -> Option<Record> {
+async fn handle_query(query: Query, pool: &Pool, cache: &mut Cache, cache_file: &str, sql_query: &str) -> Option<Record> {
     let qname = query.name().to_string().trim_end_matches('.').to_string();
     let qtype = query.query_type();
 
@@ -102,7 +103,7 @@ async fn handle_query(query: Query, pool: &Pool, cache: &mut Cache, cache_file: 
         }
     };
 
-    let sql_query = "SELECT `type`, `value` FROM `dns-override` WHERE `address` = ?";
+    //let sql_query = "SELECT `type`, `value` FROM `dns-override` WHERE `address` = ?";
     let result: Option<(String, String)> = match conn.exec_first(sql_query, (qname.clone(),)).await {
         Ok(res) => res,
         Err(e) => {
@@ -150,6 +151,7 @@ async fn run_proxy(
     db_url: &str,
     upstream_dns: &str,
     cache_file: &str,
+    sql_query: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let pool = Pool::new(db_url);
     let socket = UdpSocket::bind(listen_addr).await?;
@@ -174,7 +176,7 @@ async fn run_proxy(
 
         for query in message.queries() {
             info!("Received query from {}: {:?}", src, query);
-            if let Some(record) = handle_query(query.clone(), &pool, &mut cache, cache_file).await {
+            if let Some(record) = handle_query(query.clone(), &pool, &mut cache, cache_file, sql_query).await {
                 response.add_answer(record);
                 handled = true;
                 info!("Query handled from database or cache: {:?}", query.name());
@@ -199,9 +201,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listen_addr = format!("{}:{}", config.bind_address, config.port);
     let db_url = config.db_settings;
+    let sql_query = config.sql_query;
     let upstream_dns = config.upstream_dns;
     let cache_file = "dns_cache.json";
 
-    run_proxy(&listen_addr, &db_url, &upstream_dns, cache_file).await
+    run_proxy(&listen_addr, &db_url, &upstream_dns, cache_file, &sql_query).await
 }
 
